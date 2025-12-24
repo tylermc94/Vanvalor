@@ -1,2 +1,2 @@
 # Vanvalor
-Discord Bot to schedule weekly D&D games
+A bot to help schedule D&D games for 5 very busy adults across multiple time zones.

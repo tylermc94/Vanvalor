@@ -181,3 +181,4 @@ cython_debug/
 .cursorindexingignore
 config.py
 reminder_list.json
+data/*.json

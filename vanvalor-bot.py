@@ -1,158 +1,129 @@
 import discord
-import json
-from config import vanvalor_bot_token
-from datetime import datetime, timedelta
+from discord.ext import commands
+from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import os
 
-#set up global variables
+load_dotenv()
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-reminder_list = []
-active_polls = {}
-
-#set up functions
-
-def save_list(reminder_list):
-    """Save list to JSON File"""
-    #create json file
-    with open("reminder_list.json", "w") as final:
-        json.dump(reminder_list, final)  
-    print("List Saved!")
-
-def load_list(reminder_list):
-    """Load from JSON File"""
-    try:
-        with open("reminder_list.json", "r") as final:
-            content = final.read()
-            if content:  # Only try to load if file isn't empty
-                reminder_list.clear()
-                loaded_list = json.loads(content)
-                for reminder in loaded_list:
-                    reminder_list.append(reminder)
-                print("List Loaded!")
-            else:
-                print("Empty file, starting fresh")
-    except FileNotFoundError:
-        print("No saved list found, starting fresh")
-
-def view_list(reminder_list):
-    """Show all current tasks"""
-    list_output = ""
-    if len(reminder_list) == 0:
-        list_output = "\nNo reminders yet! You're all caught up."
-    else:
-        list_output += "\nYour reminders:"
-        for i, reminder in enumerate(reminder_list, 1):
-            list_output += f"\n{i}. {reminder["reminder"]}"
-    return list_output
-
-def delete_reminder(reminder_list, index):
-    """Delete a reminder by index"""
-    if 0 <= index < len(reminder_list):
-        del reminder_list[index]
-        print("Reminder deleted!")
-        return True
-    else:
-        print("Invalid index, cannot delete reminder.")
-        return False
-
-#set up discord intents
+# Set up discord intents
 intents = discord.Intents.default()
 intents.message_content = True
+intents.reactions = True
+intents.guild_scheduled_events = True
 
-#set up discord client
-client = discord.Client(intents=intents)
+# Set up bot with command prefix (kept for legacy reminder commands)
+bot = commands.Bot(command_prefix='$', intents=intents)
 
-#set up event handlers
-@client.event
+# Set up scheduler
+scheduler = AsyncIOScheduler()
+bot.scheduler = scheduler
+
+# Ensure data directory exists
+os.makedirs("data", exist_ok=True)
+
+
+async def load_extensions():
+    await bot.load_extension("cogs.reminders")
+    await bot.load_extension("cogs.polls")
+
+
+@bot.tree.command(name="help", description="Show how to use the Vanvalor bot")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Vanvalor Bot - Help",
+        description="A bot to help schedule D&D games for busy adults across multiple time zones.",
+        color=discord.Color.purple(),
+    )
+
+    embed.add_field(
+        name="Scheduled Polls",
+        value=(
+            "`/schedule poll` - Create a new scheduled poll\n"
+            "`/schedule cancel` - Cancel poll creation in progress\n\n"
+            "The bot will walk you through 9 steps:\n"
+            "1. Poll question\n"
+            "2. Response options (comma-separated)\n"
+            "3. Who to ping\n"
+            "4. Which channel to post in\n"
+            "5. When to send the poll\n"
+            "6. Repeat schedule (or none)\n"
+            "7. How long voting stays open\n"
+            "8. Minimum votes per option\n"
+            "9. Confirm and schedule"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Poll Lifecycle",
+        value=(
+            "1. Poll posts automatically at the scheduled time with reaction emojis\n"
+            "2. Members react to vote for their preferred options\n"
+            "3. When voting ends, results are announced with rankings\n"
+            "4. Options below the vote threshold are excluded\n"
+            "5. If there's a tie, a 30-minute tiebreaker poll runs automatically\n"
+            "6. The winning option is created as a Discord server event\n"
+            "7. If recurring, the poll re-posts on the next scheduled date"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Manage Polls",
+        value=(
+            "`/events list` - View all scheduled polls\n"
+            "`/events delete <id>` - Delete a poll\n"
+            "`/events modify <id>` - Edit a poll (type \"keep\" to skip a step)\n"
+            "`/events clone <id>` - Copy a poll as a starting point for a new one"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Reminders",
+        value=(
+            "`$remind <text>` - Add a reminder\n"
+            "`$list` - View all reminders\n"
+            "`$delete <number>` - Delete a reminder by number"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Tips",
+        value=(
+            "- All times are shown in your local timezone automatically\n"
+            "- Use natural language for times (e.g., \"Monday at 9am EST\", \"in 2 hours\")\n"
+            "- You can run multiple polls at once\n"
+            "- Poll IDs are shown as 8-character codes in `/events list`"
+        ),
+        inline=False,
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.event
 async def on_ready():
-    global reminder_list
-    print(f'We have logged in as {client.user}')
-    load_list(reminder_list)
-
-#set up message handler
-@client.event
-async def on_message(message):
-    global reminder_list
-    if message.author == client.user:
-        return
-    
-    userid = message.author.id
-
-    if userid in active_polls:
-    # Block other commands while creating poll
-        if message.content.startswith('$'):
-            await message.channel.send("You're in the middle of creating a poll! Finish that first.")
-            return
-
-    if userid in active_polls:
-    #resume poll creation
-        poll_data = active_polls[userid]
-        step = poll_data["step"]
-
-        if step == "waiting_for_event_name":
-            poll_data["event_name"] = message.content
-            poll_data["step"] = "waiting_for_times"
-            await message.channel.send('Please provide the possible times for the event, separated by commas.')
-
-        elif step == "waiting_for_times":
-            poll_data["times"] = [time.strip() for time in message.content.split(',')]
-            poll_data["step"] = "waiting_for_participants"
-            await message.channel.send('Please provide the participants for the event, separated by commas.')
-
-        elif step == "waiting_for_participants":
-            poll_data["participants"] = [participant.strip() for participant in message.content.split(',')]
-            poll_data["step"] = "waiting_for_endtime"
-            await message.channel.send('Please provide the end time for the poll (e.g., in hours).')
-
-        elif step == "waiting_for_endtime":
-            poll_data["endtime"] = message.content
-            
-            # Create and send the poll
-            poll = discord.Poll(
-                question=poll_data["event_name"],
-                duration=timedelta(hours=24)  # Default duration; can be modified based on endtime input
-            )
-    
-            for time in poll_data["times"]:
-                poll.add_answer(text=time)
-    
-            await message.channel.send(poll=poll)
-    
-            # Clean up
-            del active_polls[userid]
-            await message.channel.send('Poll created successfully!')
-
-    if message.content.startswith('$remind'):
-        message_content = message.content[8:]
-        await message.channel.send(f'Reminder set: {message_content}')
-        reminder_list.append({"reminder": message_content})
-        save_list(reminder_list)
-
-    if message.content.startswith('$list'):
-        await message.channel.send('Here are your reminders:')
-        list_output = view_list(reminder_list)
-        await message.channel.send(list_output)
-
-    if message.content.startswith('$delete'):
-        print("Delete command received")
-        try:
-            index = int(message.content[8:]) - 1
-            if delete_reminder(reminder_list, index):
-                save_list(reminder_list)
-                await message.channel.send('Reminder deleted.')
-            else:
-                await message.channel.send('Invalid index. Please provide a valid reminder number to delete.')
-        except (ValueError, IndexError):
-            await message.channel.send('Invalid index. Please provide a valid reminder number to delete.')
-
-    if message.content.startswith('$poll'):
-        active_polls[userid] = {
-            "step": "waiting_for_event_name",
-            "event_name": None,
-            "times": None,
-            "participants": None,
-            "endtime": None,
-        }
-        await message.channel.send('What is the name of the event?')
+    print(f'We have logged in as {bot.user}')
+    # Sync slash commands to each guild for instant availability
+    for guild in bot.guilds:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"Slash commands synced to {guild.name}.")
+    # Start scheduler
+    if not scheduler.running:
+        scheduler.start()
+        print("Scheduler started.")
 
 
-client.run(vanvalor_bot_token)
+import asyncio
+
+async def main():
+    async with bot:
+        await load_extensions()
+        await bot.start(BOT_TOKEN)
+
+asyncio.run(main())

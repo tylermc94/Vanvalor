@@ -1,0 +1,5 @@
+discord.py>=2.3
+apscheduler>=3.10
+dateparser>=1.2
+pytz
+python-dotenv

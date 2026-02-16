@@ -111,17 +111,29 @@ class Polls(commands.Cog):
         except FileNotFoundError:
             self.polls = {}
 
-    async def cog_load(self):
-        """Restore scheduler jobs for existing polls on bot startup."""
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Restore scheduler jobs for existing polls AFTER the scheduler has started.
+
+        Previously this was in cog_load(), which runs before the scheduler starts.
+        Jobs registered before scheduler.start() with near-future trigger times
+        would misfire and be silently skipped by APScheduler's default 1-second
+        misfire_grace_time.
+        """
+        registered = 0
         for poll_id, poll in self.polls.items():
             if poll["status"] == "scheduled":
                 self._register_send_job(poll_id, poll)
+                registered += 1
             elif poll["status"] == "active":
                 self._register_resolve_job(poll_id, poll)
+                registered += 1
+        print(f"[Polls] Registered {registered} scheduler jobs for {len(self.polls)} polls.")
 
     def _register_send_job(self, poll_id, poll):
         """Register a scheduler job to post a poll."""
         scheduler = self.bot.scheduler
+        short_id = poll_id[:8]
         if poll.get("recurring") and poll.get("schedule_cron"):
             cron = poll["schedule_cron"]
             trigger = CronTrigger(
@@ -130,12 +142,21 @@ class Polls(commands.Cog):
                 minute=cron["minute"],
                 timezone=cron.get("timezone", "US/Eastern"),
             )
+            print(f"[Polls] Registering recurring send job for poll {short_id} "
+                  f"(cron: day={cron.get('day_of_week')}, {cron['hour']}:{cron.get('minute', 0):02d} "
+                  f"{cron.get('timezone', 'US/Eastern')})")
         else:
             # One-shot: schedule for next_send_time
             send_time = datetime.fromisoformat(poll["next_send_time"])
-            if send_time <= datetime.now(send_time.tzinfo):
-                send_time = datetime.now(pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))) + timedelta(seconds=5)
+            tz = pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))
+            now = datetime.now(tz)
+            if send_time.tzinfo is None:
+                send_time = tz.localize(send_time)
+            if send_time <= now:
+                print(f"[Polls] Poll {short_id} send time is in the past ({send_time}), scheduling for 5s from now")
+                send_time = now + timedelta(seconds=5)
             trigger = DateTrigger(run_date=send_time)
+            print(f"[Polls] Registering one-shot send job for poll {short_id} at {send_time.isoformat()}")
 
         scheduler.add_job(
             self.post_poll,
@@ -144,17 +165,22 @@ class Polls(commands.Cog):
             id=f"poll_send_{poll_id}",
             replace_existing=True,
         )
+        print(f"[Polls] Job poll_send_{short_id} added to scheduler (scheduler running: {scheduler.running})")
 
     def _register_resolve_job(self, poll_id, poll):
         """Register a scheduler job to resolve a poll."""
         scheduler = self.bot.scheduler
+        short_id = poll_id[:8]
         send_time = datetime.fromisoformat(poll["next_send_time"])
+        tz = pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))
+        if send_time.tzinfo is None:
+            send_time = tz.localize(send_time)
         resolve_time = send_time + timedelta(hours=poll["poll_duration_hours"])
 
-        tz = pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))
         now = datetime.now(tz)
 
         if resolve_time <= now:
+            print(f"[Polls] Poll {short_id} resolve time is in the past ({resolve_time}), scheduling for 5s from now")
             resolve_time = now + timedelta(seconds=5)
 
         scheduler.add_job(
@@ -164,18 +190,22 @@ class Polls(commands.Cog):
             id=f"poll_resolve_{poll_id}",
             replace_existing=True,
         )
+        print(f"[Polls] Registered resolve job for poll {short_id} at {resolve_time.isoformat()}")
 
     async def post_poll(self, poll_id):
         """Post a poll message with reaction emojis."""
+        short_id = poll_id[:8]
+        print(f"[Polls] post_poll fired for poll {short_id}")
         poll = self.polls.get(poll_id)
         if not poll:
+            print(f"[Polls] Poll {short_id} not found in self.polls, aborting")
             return
 
         # Use the target post channel, not the setup channel
         post_channel_id = poll.get("post_channel_id", poll["channel_id"])
         channel = self.bot.get_channel(post_channel_id)
         if not channel:
-            print(f"Could not find channel {post_channel_id} for poll {poll_id}")
+            print(f"[Polls] Could not find channel {post_channel_id} for poll {short_id}")
             return
 
         now = datetime.now(pytz.utc)
@@ -216,14 +246,18 @@ class Polls(commands.Cog):
         poll["status"] = "active"
         poll["next_send_time"] = now.isoformat()
         self.save_polls()
+        print(f"[Polls] Poll {short_id} state changed: scheduled -> active (message {msg.id})")
 
         # Schedule resolution
         self._register_resolve_job(poll_id, poll)
 
     async def resolve_poll(self, poll_id):
         """Resolve a poll: count votes, announce results, create event."""
+        short_id = poll_id[:8]
+        print(f"[Polls] resolve_poll fired for poll {short_id}")
         poll = self.polls.get(poll_id)
         if not poll:
+            print(f"[Polls] Poll {short_id} not found in self.polls, aborting")
             return
 
         post_channel_id = poll.get("post_channel_id", poll["channel_id"])
@@ -392,6 +426,7 @@ class Polls(commands.Cog):
 
     def _handle_recurrence(self, poll_id, poll):
         """Handle recurring poll re-scheduling after resolution."""
+        short_id = poll_id[:8]
         # If this is a tiebreaker, handle the parent poll's recurrence instead
         if poll.get("is_tiebreaker"):
             parent_id = poll.get("parent_poll_id")
@@ -401,23 +436,28 @@ class Polls(commands.Cog):
                     parent["status"] = "scheduled"
                     parent["active_message_id"] = None
                     self.save_polls()
+                    print(f"[Polls] Tiebreaker {short_id} resolved, re-scheduling parent {parent_id[:8]}: active -> scheduled")
                     self._register_send_job(parent_id, parent)
                 else:
                     parent["status"] = "completed"
                     self.save_polls()
+                    print(f"[Polls] Tiebreaker {short_id} resolved, parent {parent_id[:8]}: active -> completed")
             # Mark tiebreaker as completed
             poll["status"] = "completed"
             self.save_polls()
+            print(f"[Polls] Tiebreaker {short_id}: active -> completed")
             return
 
         if poll.get("recurring") and poll.get("schedule_cron"):
             poll["status"] = "scheduled"
             poll["active_message_id"] = None
             self.save_polls()
+            print(f"[Polls] Recurring poll {short_id}: active -> scheduled (re-registering)")
             self._register_send_job(poll_id, poll)
         else:
             poll["status"] = "completed"
             self.save_polls()
+            print(f"[Polls] Poll {short_id}: active -> completed")
 
     async def _try_create_event(self, poll, winner):
         """Attempt to create a Discord scheduled event from the winning poll option."""
@@ -1000,6 +1040,9 @@ class Polls(commands.Cog):
         self.polls[poll_id] = poll
         self.save_polls()
 
+        print(f"[Polls] Poll {poll_id[:8]} {('modified' if modify_id else 'created')}: "
+              f"question='{data['question']}', send_time={data.get('send_time_parsed')}, "
+              f"tz={tz}, recurring={recurring}")
         self._register_send_job(poll_id, poll)
 
         action = "modified" if modify_id else "created"

@@ -16,8 +16,9 @@ intents.guild_scheduled_events = True
 # Set up bot with command prefix (kept for legacy reminder commands)
 bot = commands.Bot(command_prefix='$', intents=intents)
 
-# Set up scheduler
-scheduler = AsyncIOScheduler()
+# Set up scheduler with generous misfire grace time so jobs that fire
+# slightly late (e.g. during bot startup) still run instead of being skipped
+scheduler = AsyncIOScheduler(job_defaults={'misfire_grace_time': 300})
 bot.scheduler = scheduler
 
 # Ensure data directory exists

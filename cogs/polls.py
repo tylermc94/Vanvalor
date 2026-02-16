@@ -134,7 +134,23 @@ class Polls(commands.Cog):
         """Register a scheduler job to post a poll."""
         scheduler = self.bot.scheduler
         short_id = poll_id[:8]
-        if poll.get("recurring") and poll.get("schedule_cron"):
+
+        # Check if next_send_time is in the future — if so, use a DateTrigger
+        # for the initial send regardless of whether the poll is recurring.
+        # After the poll fires, _handle_recurrence will re-register with a
+        # CronTrigger for subsequent recurring sends.
+        send_time = datetime.fromisoformat(poll["next_send_time"])
+        tz = pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))
+        now = datetime.now(tz)
+        if send_time.tzinfo is None:
+            send_time = tz.localize(send_time)
+
+        use_cron = (poll.get("recurring") and poll.get("schedule_cron")
+                    and send_time <= now)
+
+        if use_cron:
+            # Recurring poll that has already had its initial send —
+            # use CronTrigger for the next occurrence
             cron = poll["schedule_cron"]
             trigger = CronTrigger(
                 day_of_week=cron.get("day_of_week"),
@@ -146,17 +162,13 @@ class Polls(commands.Cog):
                   f"(cron: day={cron.get('day_of_week')}, {cron['hour']}:{cron.get('minute', 0):02d} "
                   f"{cron.get('timezone', 'US/Eastern')})")
         else:
-            # One-shot: schedule for next_send_time
-            send_time = datetime.fromisoformat(poll["next_send_time"])
-            tz = pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))
-            now = datetime.now(tz)
-            if send_time.tzinfo is None:
-                send_time = tz.localize(send_time)
+            # Initial send (one-shot or first occurrence of recurring poll)
             if send_time <= now:
                 print(f"[Polls] Poll {short_id} send time is in the past ({send_time}), scheduling for 5s from now")
                 send_time = now + timedelta(seconds=5)
             trigger = DateTrigger(run_date=send_time)
-            print(f"[Polls] Registering one-shot send job for poll {short_id} at {send_time.isoformat()}")
+            recurring_note = " (first occurrence of recurring poll)" if poll.get("recurring") else ""
+            print(f"[Polls] Registering one-shot send job for poll {short_id} at {send_time.isoformat()}{recurring_note}")
 
         scheduler.add_job(
             self.post_poll,

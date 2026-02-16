@@ -690,6 +690,17 @@ class Polls(commands.Cog):
         data = creation["data"]
         step = creation["step"]
 
+        try:
+            await self._handle_step(message, key, creation, content, is_modify, data, step)
+        except Exception as e:
+            print(f"Error in poll creation step {step}: {e}")
+            import traceback
+            traceback.print_exc()
+            await message.channel.send(f"Something went wrong: {e}\nPoll creation cancelled.")
+            self.active_creations.pop(key, None)
+
+    async def _handle_step(self, message, key, creation, content, is_modify, data, step):
+
         if step == 1:
             # Poll question
             if is_modify and content.lower() == "keep":
@@ -865,11 +876,13 @@ class Polls(commands.Cog):
             await self._show_confirmation(message.channel, data)
 
         elif step == 9:
-            # Confirmation
-            if content.lower() in ("yes", "y", "confirm"):
+            # Confirmation - strip any unicode whitespace/formatting characters
+            cleaned = re.sub(r'[^\w]', '', content.lower())
+            print(f"[DEBUG] Confirmation input: {repr(message.content)} -> cleaned: {repr(cleaned)}")
+            if cleaned in ("yes", "y", "confirm"):
                 await self._finalize_poll(message, creation)
                 del self.active_creations[key]
-            elif content.lower() in ("no", "n", "cancel"):
+            elif cleaned in ("no", "n", "cancel"):
                 del self.active_creations[key]
                 await message.channel.send("Poll creation cancelled.")
             else:

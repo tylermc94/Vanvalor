@@ -3,3 +3,4 @@ apscheduler>=3.10
 dateparser>=1.2
 pytz
 python-dotenv
+tzdata

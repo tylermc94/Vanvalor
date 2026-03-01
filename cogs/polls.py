@@ -22,7 +22,80 @@ DAY_MAP = {
     "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun"
 }
 
+# Maps day-of-week names to Python weekday numbers (0=Monday)
+WEEKDAY_NUM_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2,
+    "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+# Maps time-of-day phrases to a default hour (24h)
+TIME_OF_DAY_MAP = {
+    "morning": 9,
+    "noon": 12,
+    "afternoon": 14,
+    "evening": 19,
+    "night": 21,
+    "midnight": 0,
+}
+
 TIEBREAKER_DURATION_MINUTES = 30
+
+
+def parse_weekday_date(label, timezone="US/Eastern"):
+    """Parse a label like 'Friday evening' or 'Saturday at 8pm' into the next
+    occurrence of that weekday at the given time.  Returns a timezone-aware
+    datetime, or None if no weekday can be detected."""
+    lower = label.lower()
+
+    # Detect weekday
+    weekday_num = None
+    for day_name, num in WEEKDAY_NUM_MAP.items():
+        if day_name in lower:
+            weekday_num = num
+            break
+    if weekday_num is None:
+        return None
+
+    # Detect hour/minute — explicit time wins over fuzzy phrase
+    hour = None
+    minute = 0
+
+    time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)', lower)
+    if time_match:
+        hour_raw = int(time_match.group(1))
+        minute = int(time_match.group(2)) if time_match.group(2) else 0
+        period = time_match.group(3)
+        if period == "pm" and hour_raw != 12:
+            hour = hour_raw + 12
+        elif period == "am" and hour_raw == 12:
+            hour = 0
+        else:
+            hour = hour_raw
+    else:
+        for phrase, default_hour in TIME_OF_DAY_MAP.items():
+            if phrase in lower:
+                hour = default_hour
+                break
+
+    if hour is None:
+        return None
+
+    tz = pytz.timezone(timezone)
+    now = datetime.now(tz)
+
+    days_ahead = weekday_num - now.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    elif days_ahead == 0:
+        # Same weekday — use next week if the time has already passed today
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            days_ahead = 7
+
+    next_dt = (now + timedelta(days=days_ahead)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    return next_dt
 
 
 def parse_timezone(text):
@@ -477,10 +550,18 @@ class Polls(commands.Cog):
         if not guild:
             return
 
-        parsed = dateparser.parse(winner["label"], settings={
-            'PREFER_DATES_FROM': 'future',
-            'RETURN_AS_TIMEZONE_AWARE': True,
-        })
+        timezone = poll.get("schedule_timezone", "US/Eastern")
+
+        # Try weekday-aware parsing first (e.g. "Friday evening", "Saturday at 8pm")
+        parsed = parse_weekday_date(winner["label"], timezone)
+
+        # Fall back to generic dateparser if weekday parsing didn't match
+        if not parsed:
+            parsed = dateparser.parse(winner["label"], settings={
+                'PREFER_DATES_FROM': 'future',
+                'RETURN_AS_TIMEZONE_AWARE': True,
+                'TIMEZONE': timezone,
+            })
 
         if not parsed:
             post_channel_id = poll.get("post_channel_id", poll["channel_id"])

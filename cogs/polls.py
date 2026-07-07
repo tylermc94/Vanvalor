@@ -15,6 +15,9 @@ import re
 DATA_PATH = "data/polls.json"
 
 NUMBER_EMOJIS = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3", "6\u20e3", "7\u20e3", "8\u20e3", "9\u20e3"]
+# Regional-indicator letters extend voting past the 9 keycap-number emojis.
+LETTER_EMOJIS = [chr(0x1F1E6 + i) for i in range(11)]  # \ud83c\udde6-\ud83c\uddf0
+OPTION_EMOJIS = NUMBER_EMOJIS + LETTER_EMOJIS  # up to 20 options
 
 # Maps day-of-week names to APScheduler cron values
 DAY_MAP = {
@@ -22,7 +25,23 @@ DAY_MAP = {
     "thursday": "thu", "friday": "fri", "saturday": "sat", "sunday": "sun"
 }
 
+# dateparser doesn't recognize these nonstandard day abbreviations
+DAY_ABBR_FIXES = {"thur": "thu", "thurs": "thu", "tues": "tue", "weds": "wed"}
+
 TIEBREAKER_DURATION_MINUTES = 30
+
+
+def normalize_shorthand_datetime(text):
+    """Expand shorthand dateparser chokes on: bare am/pm ('7p' -> '7pm') and
+    nonstandard day abbreviations ('Thur' -> 'Thu')."""
+    result = re.sub(r"\b(\d{1,2})\s*([apAP])\b", r"\1\2m", text)
+    result = re.sub(
+        r"\b(thur|thurs|tues|weds)\b",
+        lambda m: DAY_ABBR_FIXES[m.group(0).lower()],
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
 
 
 def parse_timezone(text):
@@ -404,7 +423,7 @@ class Polls(commands.Cog):
         tiebreaker_id = str(uuid.uuid4())
         options = []
         for i, opt in enumerate(tied_options):
-            options.append({"label": opt["label"], "emoji": NUMBER_EMOJIS[i]})
+            options.append({"label": opt["label"], "emoji": OPTION_EMOJIS[i]})
 
         post_channel_id = parent_poll.get("post_channel_id", parent_poll["channel_id"])
 
@@ -477,7 +496,7 @@ class Polls(commands.Cog):
         if not guild:
             return
 
-        parsed = dateparser.parse(winner["label"], settings={
+        parsed = dateparser.parse(normalize_shorthand_datetime(winner["label"]), settings={
             'PREFER_DATES_FROM': 'future',
             'RETURN_AS_TIMEZONE_AWARE': True,
         })
@@ -776,8 +795,8 @@ class Polls(commands.Cog):
                 if len(options) < 2:
                     await message.channel.send("Please provide at least 2 options, separated by commas.")
                     return
-                if len(options) > 9:
-                    await message.channel.send("Maximum 9 options allowed. Please try again.")
+                if len(options) > len(OPTION_EMOJIS):
+                    await message.channel.send(f"Maximum {len(OPTION_EMOJIS)} options allowed. Please try again.")
                     return
                 data["options_raw"] = content
 
@@ -953,7 +972,7 @@ class Polls(commands.Cog):
         options_list = [o.strip() for o in data.get("options_raw", "").split(",") if o.strip()]
         options_display = ""
         for i, opt in enumerate(options_list):
-            options_display += f"  {NUMBER_EMOJIS[i]} {opt}\n"
+            options_display += f"  {OPTION_EMOJIS[i]} {opt}\n"
 
         duration = data.get("duration_hours")
         if not duration:
@@ -999,7 +1018,7 @@ class Polls(commands.Cog):
         options_list = [o.strip() for o in data.get("options_raw", "").split(",") if o.strip()]
         options = []
         for i, label in enumerate(options_list):
-            options.append({"label": label, "emoji": NUMBER_EMOJIS[i]})
+            options.append({"label": label, "emoji": OPTION_EMOJIS[i]})
 
         # Parse recurrence
         repeat_raw = data.get("repeat_raw", "none")

@@ -14,9 +14,9 @@ import re
 
 DATA_PATH = "data/polls.json"
 
-NUMBER_EMOJIS = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3", "5\u20e3", "6\u20e3", "7\u20e3", "8\u20e3", "9\u20e3"]
+NUMBER_EMOJIS = ["1⃣", "2⃣", "3⃣", "4⃣", "5⃣", "6⃣", "7⃣", "8⃣", "9⃣"]
 # Regional-indicator letters extend voting past the 9 keycap-number emojis.
-LETTER_EMOJIS = [chr(0x1F1E6 + i) for i in range(11)]  # \ud83c\udde6-\ud83c\uddf0
+LETTER_EMOJIS = [chr(0x1F1E6 + i) for i in range(11)]  # 🇦-🇰
 OPTION_EMOJIS = NUMBER_EMOJIS + LETTER_EMOJIS  # up to 20 options
 
 # Maps day-of-week names to APScheduler cron values
@@ -106,11 +106,284 @@ def to_discord_timestamp(dt, style="F"):
     return f"<t:{unix}:{style}>"
 
 
+class PollCoreModal(discord.ui.Modal):
+    """Step 1: the 5 core poll fields. Discord modals cap out at 5 text inputs,
+    so ping target / post channel / recurrence live on PollOptionsView after submit."""
+
+    def __init__(self, cog, *, mode="create", modify_id=None, defaults=None):
+        title = {"create": "Schedule a Poll", "modify": "Modify Poll", "clone": "Clone Poll"}[mode]
+        super().__init__(title=title)
+        self.cog = cog
+        self.mode = mode
+        self.modify_id = modify_id
+        self.carry_over = defaults or {}
+
+        self.question = discord.ui.TextInput(
+            label="Poll question",
+            default=self.carry_over.get("question", ""),
+            max_length=200,
+        )
+        self.options = discord.ui.TextInput(
+            label=f"Options, comma-separated (max {len(OPTION_EMOJIS)})",
+            style=discord.TextStyle.paragraph,
+            default=self.carry_over.get("options_raw", ""),
+            placeholder="Mon 7pm, Tue 7pm, Sat 8am, Sun 7pm",
+            max_length=1000,
+        )
+        self.send_time = discord.ui.TextInput(
+            label="Send time",
+            default=self.carry_over.get("send_time_raw", ""),
+            placeholder='"Monday at 9am EST", "in 2 hours"',
+        )
+        self.duration = discord.ui.TextInput(
+            label="Poll duration",
+            default=self.carry_over.get("duration_raw", "24 hours"),
+            placeholder='"24 hours", "2 days"',
+        )
+        self.vote_threshold = discord.ui.TextInput(
+            label="Minimum votes to count (0 = no minimum)",
+            default=str(self.carry_over.get("vote_threshold", 0)),
+            max_length=3,
+        )
+        for item in (self.question, self.options, self.send_time, self.duration, self.vote_threshold):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        errors = []
+
+        options_list = [o.strip() for o in self.options.value.split(",") if o.strip()]
+        if len(options_list) < 2:
+            errors.append("Provide at least 2 options.")
+        elif len(options_list) > len(OPTION_EMOJIS):
+            errors.append(f"Maximum {len(OPTION_EMOJIS)} options allowed.")
+
+        send_parsed = dateparser.parse(
+            normalize_shorthand_datetime(self.send_time.value),
+            settings={'PREFER_DATES_FROM': 'future', 'RETURN_AS_TIMEZONE_AWARE': True},
+        )
+        if not send_parsed:
+            errors.append(f'Couldn\'t understand send time "{self.send_time.value}".')
+
+        duration_hours = self.cog._parse_duration(self.duration.value)
+        if duration_hours is None:
+            errors.append(f'Couldn\'t understand duration "{self.duration.value}".')
+
+        vote_threshold = None
+        try:
+            vote_threshold = int(self.vote_threshold.value)
+            if vote_threshold < 0:
+                raise ValueError
+        except ValueError:
+            errors.append("Vote threshold must be a non-negative number.")
+
+        if errors:
+            retry_defaults = dict(self.carry_over)
+            retry_defaults.update({
+                "question": self.question.value,
+                "options_raw": self.options.value,
+                "send_time_raw": self.send_time.value,
+                "duration_raw": self.duration.value,
+                "vote_threshold": self.vote_threshold.value,
+            })
+            await interaction.response.send_message(
+                "⚠️ " + "\n⚠️ ".join(errors),
+                view=RetryView(self.cog, mode=self.mode, modify_id=self.modify_id, defaults=retry_defaults),
+                ephemeral=True,
+            )
+            return
+
+        data = dict(self.carry_over)
+        data.update({
+            "question": self.question.value,
+            "options_raw": self.options.value,
+            "send_time_raw": self.send_time.value,
+            "send_time_parsed": send_parsed.isoformat(),
+            "timezone": parse_timezone(self.send_time.value),
+            "duration_raw": self.duration.value,
+            "duration_hours": duration_hours,
+            "vote_threshold": vote_threshold,
+        })
+        data.setdefault("ping_target", "@everyone")
+        data.setdefault("post_channel_id", interaction.channel_id)
+        data.setdefault("repeat_raw", "none")
+        data.setdefault("schedule_cron", None)
+
+        view = PollOptionsView(self.cog, mode=self.mode, modify_id=self.modify_id,
+                                data=data, creator_id=interaction.user.id)
+        await interaction.response.send_message(embed=view.build_embed(), view=view)
+        view.message = await interaction.original_response()
+
+
+class RetryView(discord.ui.View):
+    """Shown when PollCoreModal validation fails, so the user can fix just the bad field."""
+
+    def __init__(self, cog, *, mode, modify_id, defaults):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.mode = mode
+        self.modify_id = modify_id
+        self.defaults = defaults
+
+    @discord.ui.button(label="Fix & Resubmit", style=discord.ButtonStyle.primary)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            PollCoreModal(self.cog, mode=self.mode, modify_id=self.modify_id, defaults=self.defaults)
+        )
+
+
+class RecurrenceModal(discord.ui.Modal):
+    def __init__(self, options_view):
+        super().__init__(title="Set Recurrence")
+        self.options_view = options_view
+        current = options_view.data.get("repeat_raw", "none")
+        self.recurrence = discord.ui.TextInput(
+            label="Repeat schedule",
+            placeholder='"every Monday at 9am EST", or leave blank for none',
+            default=current if current.lower() not in ("none", "no") else "",
+            required=False,
+        )
+        self.add_item(self.recurrence)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.recurrence.value.strip() or "none"
+        recurrence = parse_recurrence(text)
+        if text.lower() not in ("none", "no") and recurrence is None:
+            await interaction.response.send_message(
+                f'Couldn\'t understand recurrence "{text}". Try something like "every Monday at 9am EST".',
+                ephemeral=True,
+            )
+            return
+        self.options_view.data["repeat_raw"] = text
+        self.options_view.data["schedule_cron"] = recurrence
+        await interaction.response.edit_message(embed=self.options_view.build_embed(), view=self.options_view)
+
+
+class PollOptionsView(discord.ui.View):
+    """Step 2: post channel, ping target, and recurrence — plus confirm/cancel."""
+
+    def __init__(self, cog, *, mode, modify_id, data, creator_id):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.mode = mode
+        self.modify_id = modify_id
+        self.data = data
+        self.creator_id = creator_id
+        self.message = None
+
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="Post channel (defaults to this channel)",
+            channel_types=[discord.ChannelType.text],
+            min_values=0, max_values=1, row=0,
+        )
+        self.channel_select.callback = self.on_channel_select
+        self.add_item(self.channel_select)
+
+        self.role_select = discord.ui.RoleSelect(
+            placeholder="Ping a role instead (optional)",
+            min_values=0, max_values=1, row=1,
+        )
+        self.role_select.callback = self.on_role_select
+        self.add_item(self.role_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.creator_id:
+            await interaction.response.send_message(
+                "Only the person creating this poll can use these controls.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="Poll setup timed out (5 minute limit). Use `/schedule poll` to start again.",
+                    embed=None, view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+    def build_embed(self):
+        options_list = [o.strip() for o in self.data.get("options_raw", "").split(",") if o.strip()]
+        options_display = "\n".join(f"  {OPTION_EMOJIS[i]} {opt}" for i, opt in enumerate(options_list)) or "?"
+
+        send_time_display = self.data.get("send_time_raw", "?")
+        if self.data.get("send_time_parsed"):
+            try:
+                parsed_dt = datetime.fromisoformat(self.data["send_time_parsed"])
+                send_time_display = to_discord_timestamp(parsed_dt, "F")
+            except (ValueError, TypeError):
+                pass
+
+        repeat_text = self.data.get("repeat_raw", "none")
+        if repeat_text.lower() in ("none", "no"):
+            repeat_text = "No (one-time poll)"
+
+        post_channel = f"<#{self.data['post_channel_id']}>" if self.data.get("post_channel_id") else "This channel"
+
+        embed = discord.Embed(title="Poll Setup — Confirm to schedule", color=discord.Color.gold())
+        embed.add_field(name="Question", value=self.data.get("question", "?"), inline=False)
+        embed.add_field(name="Options", value=options_display, inline=False)
+        embed.add_field(name="Ping", value=self.data.get("ping_target") or "No ping", inline=True)
+        embed.add_field(name="Post In", value=post_channel, inline=True)
+        embed.add_field(name="Send Time", value=send_time_display, inline=True)
+        embed.add_field(name="Repeat", value=repeat_text, inline=True)
+        embed.add_field(name="Duration", value=self.data.get("duration_raw", "?"), inline=True)
+        embed.add_field(name="Vote Threshold", value=str(self.data.get("vote_threshold", 0)), inline=True)
+        embed.set_footer(text="Use the menus/buttons below to adjust, then Confirm.")
+        return embed
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_channel_select(self, interaction: discord.Interaction):
+        self.data["post_channel_id"] = self.channel_select.values[0].id
+        await self.refresh(interaction)
+
+    async def on_role_select(self, interaction: discord.Interaction):
+        self.data["ping_target"] = self.role_select.values[0].mention
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="@everyone", style=discord.ButtonStyle.secondary, row=2)
+    async def ping_everyone(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.data["ping_target"] = "@everyone"
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="@here", style=discord.ButtonStyle.secondary, row=2)
+    async def ping_here(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.data["ping_target"] = "@here"
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="No ping", style=discord.ButtonStyle.secondary, row=2)
+    async def ping_none(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.data["ping_target"] = ""
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="One-time", style=discord.ButtonStyle.secondary, row=3)
+    async def repeat_none(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.data["repeat_raw"] = "none"
+        self.data["schedule_cron"] = None
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Set recurrence…", style=discord.ButtonStyle.secondary, row=3)
+    async def repeat_set(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RecurrenceModal(self))
+
+    @discord.ui.button(label="Confirm & Schedule", style=discord.ButtonStyle.success, row=4)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await self.cog._finalize_poll_from_data(interaction, self.mode, self.modify_id, self.data)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=4)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="Poll creation cancelled.", embed=None, view=None)
+
+
 class Polls(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.polls = {}
-        self.active_creations = {}  # (guild_id, user_id) -> creation state
         self.load_polls()
 
     def save_polls(self):
@@ -537,40 +810,8 @@ class Polls(commands.Cog):
 
     @schedule_group.command(name="poll", description="Create a new scheduled poll")
     async def schedule_poll(self, interaction: discord.Interaction):
-        """Start the multi-step poll creation dialog."""
-        key = (interaction.guild_id, interaction.user.id)
-
-        if key in self.active_creations:
-            await interaction.response.send_message(
-                "You already have a poll creation in progress! Finish or cancel it first.",
-                ephemeral=True,
-            )
-            return
-
-        self.active_creations[key] = {
-            "step": 1,
-            "channel_id": interaction.channel_id,
-            "guild_id": interaction.guild_id,
-            "creator_id": interaction.user.id,
-            "last_interaction": datetime.now(pytz.utc),
-            "data": {},
-        }
-
-        await interaction.response.send_message(
-            "Let's create a scheduled poll! I'll ask you a series of questions.\n\n"
-            "**Step 1/9:** What is the poll question?\n"
-            "*(e.g., \"When can everyone play D&D this week?\")*",
-            ephemeral=False,
-        )
-
-    @schedule_group.command(name="cancel", description="Cancel poll creation in progress")
-    async def schedule_cancel(self, interaction: discord.Interaction):
-        key = (interaction.guild_id, interaction.user.id)
-        if key in self.active_creations:
-            del self.active_creations[key]
-            await interaction.response.send_message("Poll creation cancelled.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No poll creation in progress.", ephemeral=True)
+        """Open the poll creation form."""
+        await interaction.response.send_modal(PollCoreModal(self, mode="create"))
 
     events_group = app_commands.Group(name="events", description="Manage scheduled polls")
 
@@ -587,7 +828,7 @@ class Polls(commands.Cog):
 
         for pid, p in guild_polls.items():
             short_id = pid[:8]
-            status_emoji = {"scheduled": "\U0001f550", "active": "\U0001f7e2", "completed": "\u2705"}.get(p["status"], "\u2753")
+            status_emoji = {"scheduled": "\U0001f550", "active": "\U0001f7e2", "completed": "✅"}.get(p["status"], "❓")
 
             info = f"Status: {status_emoji} {p['status']}"
             if p.get("recurring"):
@@ -640,42 +881,27 @@ class Polls(commands.Cog):
             await interaction.response.send_message(f"No poll found with ID `{poll_id}`.", ephemeral=True)
             return
 
-        key = (interaction.guild_id, interaction.user.id)
-        if key in self.active_creations:
-            await interaction.response.send_message(
-                "You already have a poll creation in progress! Finish or cancel it first.",
-                ephemeral=True,
-            )
-            return
-
         poll = self.polls[full_id]
-        post_ch = poll.get("post_channel_id", poll["channel_id"])
-        self.active_creations[key] = {
-            "step": 1,
-            "channel_id": interaction.channel_id,
-            "guild_id": interaction.guild_id,
-            "creator_id": interaction.user.id,
-            "last_interaction": datetime.now(pytz.utc),
-            "mode": "modify",
-            "modify_id": full_id,
-            "data": {
-                "question": poll["question"],
-                "options_raw": ", ".join(o["label"] for o in poll["options"]),
-                "ping_target": poll.get("ping_target", "@everyone"),
-                "post_channel_id": post_ch,
-                "send_time_raw": poll.get("next_send_time", ""),
-                "repeat_raw": "none",
-                "duration_raw": str(poll.get("poll_duration_hours", 24)),
-                "vote_threshold": poll.get("vote_threshold", 0),
-            },
+        defaults = {
+            "question": poll["question"],
+            "options_raw": ", ".join(o["label"] for o in poll["options"]),
+            "send_time_raw": self._format_send_time_default(poll),
+            "duration_raw": str(poll.get("poll_duration_hours", 24)),
+            "vote_threshold": poll.get("vote_threshold", 0),
+            "ping_target": poll.get("ping_target", "@everyone"),
+            "post_channel_id": poll.get("post_channel_id", poll["channel_id"]),
+            "repeat_raw": "none",
+            "schedule_cron": poll.get("schedule_cron"),
         }
-
-        current = self.active_creations[key]["data"]
-        await interaction.response.send_message(
-            f"Modifying poll: **{poll['question']}**\n"
-            f"Type your new answer at each step, or type **keep** to keep the current value.\n\n"
-            f"**Step 1/9:** What is the poll question?\n"
-            f"*Current: {current['question']}*",
+        if poll.get("recurring") and poll.get("schedule_cron"):
+            cron = poll["schedule_cron"]
+            defaults["repeat_raw"] = (
+                f"every {cron.get('day_of_week', '?')} at "
+                f"{cron.get('hour', 0):02d}:{cron.get('minute', 0):02d} "
+                f"{cron.get('timezone', 'US/Eastern')}"
+            )
+        await interaction.response.send_modal(
+            PollCoreModal(self, mode="modify", modify_id=full_id, defaults=defaults)
         )
 
     @events_group.command(name="clone", description="Clone a scheduled poll")
@@ -686,42 +912,32 @@ class Polls(commands.Cog):
             await interaction.response.send_message(f"No poll found with ID `{poll_id}`.", ephemeral=True)
             return
 
-        key = (interaction.guild_id, interaction.user.id)
-        if key in self.active_creations:
-            await interaction.response.send_message(
-                "You already have a poll creation in progress! Finish or cancel it first.",
-                ephemeral=True,
-            )
-            return
-
         poll = self.polls[full_id]
-        post_ch = poll.get("post_channel_id", poll["channel_id"])
-        self.active_creations[key] = {
-            "step": 1,
-            "channel_id": interaction.channel_id,
-            "guild_id": interaction.guild_id,
-            "creator_id": interaction.user.id,
-            "last_interaction": datetime.now(pytz.utc),
-            "mode": "clone",
-            "data": {
-                "question": poll["question"],
-                "options_raw": ", ".join(o["label"] for o in poll["options"]),
-                "ping_target": poll.get("ping_target", "@everyone"),
-                "post_channel_id": post_ch,
-                "send_time_raw": "",
-                "repeat_raw": "none",
-                "duration_raw": str(poll.get("poll_duration_hours", 24)),
-                "vote_threshold": poll.get("vote_threshold", 0),
-            },
+        defaults = {
+            "question": poll["question"],
+            "options_raw": ", ".join(o["label"] for o in poll["options"]),
+            "send_time_raw": "",
+            "duration_raw": str(poll.get("poll_duration_hours", 24)),
+            "vote_threshold": poll.get("vote_threshold", 0),
+            "ping_target": poll.get("ping_target", "@everyone"),
+            "post_channel_id": poll.get("post_channel_id", poll["channel_id"]),
+            "repeat_raw": "none",
+            "schedule_cron": None,
         }
-
-        current = self.active_creations[key]["data"]
-        await interaction.response.send_message(
-            f"Cloning poll: **{poll['question']}**\n"
-            f"Type your new answer at each step, or type **keep** to keep the cloned value.\n\n"
-            f"**Step 1/9:** What is the poll question?\n"
-            f"*Current: {current['question']}*",
+        await interaction.response.send_modal(
+            PollCoreModal(self, mode="clone", modify_id=None, defaults=defaults)
         )
+
+    def _format_send_time_default(self, poll):
+        """Render a poll's stored next_send_time as text dateparser can re-parse,
+        for pre-filling the modal on /events modify."""
+        try:
+            dt = datetime.fromisoformat(poll["next_send_time"])
+            tz = pytz.timezone(poll.get("schedule_timezone", "US/Eastern"))
+            dt = tz.localize(dt) if dt.tzinfo is None else dt.astimezone(tz)
+            return dt.strftime("%Y-%m-%d %I:%M%p %Z")
+        except (KeyError, ValueError, TypeError):
+            return ""
 
     def _find_poll_id(self, short_id, guild_id):
         """Find a full poll ID from a short prefix, scoped to a guild."""
@@ -731,316 +947,21 @@ class Polls(commands.Cog):
                 return pid
         return None
 
-    # ---- Multi-Step Dialog Listener ----
-
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        if message.author.bot:
-            return
-
-        key = (getattr(message.guild, "id", None), message.author.id)
-        if key not in self.active_creations:
-            return
-
-        creation = self.active_creations[key]
-
-        # Check if message is in the same channel
-        if message.channel.id != creation["channel_id"]:
-            return
-
-        # Timeout check (5 minutes)
-        elapsed = (datetime.now(pytz.utc) - creation["last_interaction"]).total_seconds()
-        if elapsed > 300:
-            del self.active_creations[key]
-            await message.channel.send("Poll creation timed out (5 minute limit). Use `/schedule poll` to start again.")
-            return
-
-        creation["last_interaction"] = datetime.now(pytz.utc)
-        content = message.content.strip()
-        is_modify = creation.get("mode") in ("modify", "clone")
-        data = creation["data"]
-        step = creation["step"]
-
-        try:
-            await self._handle_step(message, key, creation, content, is_modify, data, step)
-        except Exception as e:
-            print(f"Error in poll creation step {step}: {e}")
-            import traceback
-            traceback.print_exc()
-            await message.channel.send(f"Something went wrong: {e}\nPoll creation cancelled.")
-            self.active_creations.pop(key, None)
-
-    async def _handle_step(self, message, key, creation, content, is_modify, data, step):
-
-        if step == 1:
-            # Poll question
-            if is_modify and content.lower() == "keep":
-                pass
-            else:
-                data["question"] = content
-
-            creation["step"] = 2
-            hint = f"\n*Current: {data.get('options_raw', '')}*" if is_modify else ""
-            await message.channel.send(
-                f"**Step 2/9:** List the response options, separated by commas.\n"
-                f"*(e.g., \"Friday Night, Saturday Morning, Saturday Night\")*{hint}"
-            )
-
-        elif step == 2:
-            # Options
-            if is_modify and content.lower() == "keep":
-                pass
-            else:
-                options = [o.strip() for o in content.split(",") if o.strip()]
-                if len(options) < 2:
-                    await message.channel.send("Please provide at least 2 options, separated by commas.")
-                    return
-                if len(options) > len(OPTION_EMOJIS):
-                    await message.channel.send(f"Maximum {len(OPTION_EMOJIS)} options allowed. Please try again.")
-                    return
-                data["options_raw"] = content
-
-            creation["step"] = 3
-            hint = f"\n*Current: {data.get('ping_target', '')}*" if is_modify else ""
-            await message.channel.send(
-                f"**Step 3/9:** Who should be pinged when the poll is posted?\n"
-                f"*(e.g., @everyone, @here, or mention a role)*{hint}"
-            )
-
-        elif step == 3:
-            # Ping target
-            if is_modify and content.lower() == "keep":
-                pass
-            else:
-                data["ping_target"] = content
-
-            # Step 4: Channel selection
-            creation["step"] = 4
-            # List text channels in the guild
-            guild = message.guild
-            if guild:
-                text_channels = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages]
-                channel_list = "\n".join([f"  - <#{ch.id}>" for ch in text_channels[:20]])
-                current_hint = ""
-                if is_modify and data.get("post_channel_id"):
-                    current_hint = f"\n*Current: <#{data['post_channel_id']}>*"
-                await message.channel.send(
-                    f"**Step 4/9:** Which channel should the poll be posted in?\n"
-                    f"*(Mention a channel like #general, or type \"here\" to post in this channel)*\n\n"
-                    f"Available channels:\n{channel_list}{current_hint}"
-                )
-            else:
-                creation["step"] = 5  # skip if no guild context
-                await self._ask_send_time(message.channel, data, is_modify)
-
-        elif step == 4:
-            # Channel selection
-            if is_modify and content.lower() == "keep":
-                pass
-            elif content.lower() == "here":
-                data["post_channel_id"] = message.channel.id
-            else:
-                # Try to extract channel ID from mention like <#123456>
-                match = re.match(r"<#(\d+)>", content)
-                if match:
-                    ch_id = int(match.group(1))
-                    ch = message.guild.get_channel(ch_id) if message.guild else None
-                    if ch:
-                        data["post_channel_id"] = ch_id
-                    else:
-                        await message.channel.send("I couldn't find that channel. Please try again (mention it with #).")
-                        return
-                else:
-                    # Try to find by name
-                    if message.guild:
-                        found = discord.utils.get(message.guild.text_channels, name=content.strip("#").lower())
-                        if found:
-                            data["post_channel_id"] = found.id
-                        else:
-                            await message.channel.send("I couldn't find that channel. Please mention it with # or type \"here\".")
-                            return
-                    else:
-                        data["post_channel_id"] = message.channel.id
-
-            creation["step"] = 5
-            await self._ask_send_time(message.channel, data, is_modify)
-
-        elif step == 5:
-            # Send time
-            if is_modify and content.lower() == "keep":
-                if not data.get("send_time_raw"):
-                    await message.channel.send("No existing send time to keep. Please provide one.")
-                    return
-            else:
-                parsed = dateparser.parse(content, settings={
-                    'PREFER_DATES_FROM': 'future',
-                    'RETURN_AS_TIMEZONE_AWARE': True,
-                })
-                if not parsed:
-                    await message.channel.send("I couldn't understand that time. Please try again. (e.g., \"Monday at 9am EST\")")
-                    return
-                data["send_time_raw"] = content
-                data["send_time_parsed"] = parsed.isoformat()
-                tz = parse_timezone(content)
-                data["timezone"] = tz
-                # Show the time using Discord's auto-converting timestamp
-                discord_ts = to_discord_timestamp(parsed, "F")
-                relative_ts = to_discord_timestamp(parsed, "R")
-                await message.channel.send(f"Got it — I'll send the poll at: {discord_ts} ({relative_ts})")
-
-            creation["step"] = 6
-            hint = f"\n*Current: {data.get('repeat_raw', 'none')}*" if is_modify else ""
-            await message.channel.send(
-                f"**Step 6/9:** Should this poll repeat? If so, provide the schedule.\n"
-                f"*(e.g., \"every Monday at 9am EST\" or type \"none\")*{hint}"
-            )
-
-        elif step == 6:
-            # Repeat schedule
-            if is_modify and content.lower() == "keep":
-                pass
-            else:
-                data["repeat_raw"] = content
-
-            creation["step"] = 7
-            hint = f"\n*Current: {data.get('duration_raw', '')}*" if is_modify else ""
-            await message.channel.send(
-                f"**Step 7/9:** How long should the poll stay open for voting?\n"
-                f"*(e.g., \"24 hours\", \"2 days\", \"48 hours\")*{hint}"
-            )
-
-        elif step == 7:
-            # Duration
-            if is_modify and content.lower() == "keep":
-                pass
-            else:
-                duration_hours = self._parse_duration(content)
-                if duration_hours is None:
-                    await message.channel.send("I couldn't understand that duration. Please try again. (e.g., \"24 hours\", \"2 days\")")
-                    return
-                data["duration_raw"] = content
-                data["duration_hours"] = duration_hours
-
-            creation["step"] = 8
-            hint = f"\n*Current: {data.get('vote_threshold', 0)}*" if is_modify else ""
-            await message.channel.send(
-                f"**Step 8/9:** Minimum votes for an option to count in results?\n"
-                f"*(Enter a number, e.g., \"3\" means options with fewer than 3 votes are excluded. Use \"0\" for no minimum.)*{hint}"
-            )
-
-        elif step == 8:
-            # Vote threshold
-            if is_modify and content.lower() == "keep":
-                pass
-            else:
-                try:
-                    threshold = int(content)
-                    if threshold < 0:
-                        raise ValueError
-                    data["vote_threshold"] = threshold
-                except ValueError:
-                    await message.channel.send("Please enter a valid number (0 or higher).")
-                    return
-
-            # Show confirmation
-            creation["step"] = 9
-            await self._show_confirmation(message.channel, data)
-
-        elif step == 9:
-            # Confirmation - strip any unicode whitespace/formatting characters
-            cleaned = re.sub(r'[^\w]', '', content.lower())
-            print(f"[DEBUG] Confirmation input: {repr(message.content)} -> cleaned: {repr(cleaned)}")
-            if cleaned in ("yes", "y", "confirm"):
-                await self._finalize_poll(message, creation)
-                del self.active_creations[key]
-            elif cleaned in ("no", "n", "cancel"):
-                del self.active_creations[key]
-                await message.channel.send("Poll creation cancelled.")
-            else:
-                await message.channel.send("Please type **yes** to confirm or **no** to cancel.")
-
-    async def _ask_send_time(self, channel, data, is_modify):
-        """Helper to ask the send time question."""
-        hint = f"\n*Current: {data.get('send_time_raw', '')}*" if is_modify else ""
-        await channel.send(
-            f"**Step 5/9:** When should the poll be sent?\n"
-            f"*(e.g., \"Monday at 9am EST\", \"tomorrow at 3pm\", \"in 2 hours\")*{hint}"
-        )
-
-    async def _show_confirmation(self, channel, data):
-        """Show a summary of the poll for confirmation."""
+    async def _finalize_poll_from_data(self, interaction, mode, modify_id, data):
+        """Create/update the poll from the modal+view data and schedule it."""
         options_list = [o.strip() for o in data.get("options_raw", "").split(",") if o.strip()]
-        options_display = ""
-        for i, opt in enumerate(options_list):
-            options_display += f"  {OPTION_EMOJIS[i]} {opt}\n"
+        options = [{"label": label, "emoji": OPTION_EMOJIS[i]} for i, label in enumerate(options_list)]
 
-        duration = data.get("duration_hours")
-        if not duration:
-            duration = self._parse_duration(data.get("duration_raw", "24 hours"))
-            data["duration_hours"] = duration
-
-        repeat_text = data.get("repeat_raw", "none")
-        if repeat_text.lower() in ("none", "no"):
-            repeat_text = "No (one-time poll)"
-
-        # Format send time with Discord timestamp
-        send_time_display = data.get("send_time_raw", "?")
-        if data.get("send_time_parsed"):
-            try:
-                parsed_dt = datetime.fromisoformat(data["send_time_parsed"])
-                send_time_display = to_discord_timestamp(parsed_dt, "F")
-            except (ValueError, TypeError):
-                pass
-
-        post_channel = f"<#{data['post_channel_id']}>" if data.get("post_channel_id") else "This channel"
-
-        embed = discord.Embed(
-            title="Poll Summary — Confirm?",
-            color=discord.Color.gold(),
-        )
-        embed.add_field(name="Question", value=data.get("question", "?"), inline=False)
-        embed.add_field(name="Options", value=options_display or "?", inline=False)
-        embed.add_field(name="Ping", value=data.get("ping_target", "?"), inline=True)
-        embed.add_field(name="Post In", value=post_channel, inline=True)
-        embed.add_field(name="Send Time", value=send_time_display, inline=True)
-        embed.add_field(name="Repeat", value=repeat_text, inline=True)
-        embed.add_field(name="Duration", value=data.get("duration_raw", "?"), inline=True)
-        embed.add_field(name="Vote Threshold", value=str(data.get("vote_threshold", 0)), inline=True)
-
-        await channel.send(embed=embed)
-        await channel.send("Type **yes** to confirm or **no** to cancel.")
-
-    async def _finalize_poll(self, message, creation):
-        """Create the poll from collected data and schedule it."""
-        data = creation["data"]
-
-        # Build options with emojis
-        options_list = [o.strip() for o in data.get("options_raw", "").split(",") if o.strip()]
-        options = []
-        for i, label in enumerate(options_list):
-            options.append({"label": label, "emoji": OPTION_EMOJIS[i]})
-
-        # Parse recurrence
-        repeat_raw = data.get("repeat_raw", "none")
-        recurrence = parse_recurrence(repeat_raw)
+        recurrence = parse_recurrence(data.get("repeat_raw", "none"))
         recurring = recurrence is not None
 
-        # Parse duration
-        duration_hours = data.get("duration_hours")
-        if not duration_hours:
-            duration_hours = self._parse_duration(data.get("duration_raw", "24 hours")) or 24
-
-        # Parse timezone
+        duration_hours = data.get("duration_hours") or self._parse_duration(data.get("duration_raw", "24 hours")) or 24
         tz = data.get("timezone", "US/Eastern")
+        post_channel_id = data.get("post_channel_id", interaction.channel_id)
 
-        # Determine post channel (default to the channel where setup happened)
-        post_channel_id = data.get("post_channel_id", creation["channel_id"])
-
-        # Determine poll ID
-        modify_id = creation.get("modify_id")
         if modify_id:
             poll_id = modify_id
-            for prefix in ["poll_send_", "poll_resolve_"]:
+            for prefix in ("poll_send_", "poll_resolve_"):
                 try:
                     self.bot.scheduler.remove_job(f"{prefix}{poll_id}")
                 except Exception:
@@ -1050,10 +971,10 @@ class Polls(commands.Cog):
 
         poll = {
             "id": poll_id,
-            "guild_id": creation["guild_id"],
-            "channel_id": creation["channel_id"],
+            "guild_id": interaction.guild_id,
+            "channel_id": interaction.channel_id,
             "post_channel_id": post_channel_id,
-            "creator_id": creation["creator_id"],
+            "creator_id": interaction.user.id,
             "question": data["question"],
             "options": options,
             "ping_target": data.get("ping_target", "@everyone"),
@@ -1071,16 +992,20 @@ class Polls(commands.Cog):
         self.polls[poll_id] = poll
         self.save_polls()
 
-        print(f"[Polls] Poll {poll_id[:8]} {('modified' if modify_id else 'created')}: "
+        print(f"[Polls] Poll {poll_id[:8]} {'modified' if modify_id else 'created'}: "
               f"question='{data['question']}', send_time={data.get('send_time_parsed')}, "
               f"tz={tz}, recurring={recurring}")
         self._register_send_job(poll_id, poll)
 
         action = "modified" if modify_id else "created"
-        await message.channel.send(
-            f"Poll {action} and scheduled! ID: `{poll_id[:8]}`\n"
-            f"Poll will be posted in <#{post_channel_id}>.\n"
-            f"Use `/events list` to see all scheduled polls."
+        await interaction.response.edit_message(
+            content=(
+                f"Poll {action} and scheduled! ID: `{poll_id[:8]}`\n"
+                f"Poll will be posted in <#{post_channel_id}>.\n"
+                f"Use `/events list` to see all scheduled polls."
+            ),
+            embed=None,
+            view=None,
         )
 
     def _parse_duration(self, text):

@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
 
+from cogs import polls
+
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
@@ -41,18 +43,13 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="Scheduled Polls",
         value=(
-            "`/schedule poll` - Create a new scheduled poll\n"
-            "`/schedule cancel` - Cancel poll creation in progress\n\n"
-            "The bot will walk you through 9 steps:\n"
-            "1. Poll question\n"
-            "2. Response options (comma-separated)\n"
-            "3. Who to ping\n"
-            "4. Which channel to post in\n"
-            "5. When to send the poll\n"
-            "6. Repeat schedule (or none)\n"
-            "7. How long voting stays open\n"
-            "8. Minimum votes per option\n"
-            "9. Confirm and schedule"
+            "`/schedule poll` - Create a new scheduled poll\n\n"
+            "Fill out the pop-up form (question, options, send time, duration, "
+            "vote threshold), then use the buttons/menus on the confirmation screen "
+            "to set the post channel, ping target, and repeat schedule before "
+            "confirming.\n\n"
+            "Options can be shorthand like \"Mon 7pm, Sat 8am\" — up to "
+            f"{len(polls.OPTION_EMOJIS)} of them."
         ),
         inline=False,
     )

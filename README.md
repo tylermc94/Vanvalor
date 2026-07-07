@@ -23,8 +23,7 @@ A simple shared reminder list for the group.
 
 | Command | Description |
 |---------|-------------|
-| `/schedule poll` | Create a new scheduled poll (guided 9-step setup) |
-| `/schedule cancel` | Cancel poll creation in progress |
+| `/schedule poll` | Create a new scheduled poll (pop-up form + confirm screen) |
 | `/events list` | View all scheduled polls with status and IDs |
 | `/events delete <id>` | Delete a scheduled poll |
 | `/events modify <id>` | Edit an existing poll |
